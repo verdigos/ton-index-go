@@ -1749,6 +1749,102 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v3/pendingEvents": {
+            "get": {
+                "security": [
+                    {
+                        "APIKeyHeader": []
+                    },
+                    {
+                        "APIKeyQuery": []
+                    }
+                ],
+                "description": "Get events by specified filter.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "events"
+                ],
+                "summary": "Get Pending Events",
+                "operationId": "api_v3_get_pending_events",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "List of account addresses to get transactions. Can be sent in hex, base64 or base64url form.",
+                        "name": "account",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/EventsResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/RequestError"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v3/pendingTransasctions": {
+            "get": {
+                "security": [
+                    {
+                        "APIKeyHeader": []
+                    },
+                    {
+                        "APIKeyQuery": []
+                    }
+                ],
+                "description": "Get pending transactions by specified filter.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "blockchain"
+                ],
+                "summary": "Get pending transactions",
+                "operationId": "api_v3_get_pending_transactions",
+                "parameters": [
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "collectionFormat": "multi",
+                        "description": "List of account addresses to get transactions. Can be sent in hex, base64 or base64url form.",
+                        "name": "account",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/TransactionsResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/RequestError"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v3/runGetMethod": {
             "post": {
                 "security": [
@@ -3326,29 +3422,6 @@ const docTemplate = `{
                 }
             }
         },
-        "TraceNode": {
-            "type": "object",
-            "properties": {
-                "children": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/TraceNode"
-                    }
-                },
-                "in_msg": {
-                    "$ref": "#/definitions/Message"
-                },
-                "in_msg_hash": {
-                    "type": "string"
-                },
-                "transaction": {
-                    "$ref": "#/definitions/Transaction"
-                },
-                "tx_hash": {
-                    "type": "string"
-                }
-            }
-        },
         "Transaction": {
             "type": "object",
             "properties": {
@@ -3366,6 +3439,9 @@ const docTemplate = `{
                 },
                 "description": {
                     "$ref": "#/definitions/TransactionDescr"
+                },
+                "emulated": {
+                    "type": "boolean"
                 },
                 "end_status": {
                     "type": "string"
@@ -3681,6 +3757,29 @@ const docTemplate = `{
                 },
                 "start_from": {
                     "type": "integer"
+                }
+            }
+        },
+        "index.TraceNode": {
+            "type": "object",
+            "properties": {
+                "children": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/index.TraceNode"
+                    }
+                },
+                "in_msg": {
+                    "$ref": "#/definitions/Message"
+                },
+                "in_msg_hash": {
+                    "type": "string"
+                },
+                "transaction": {
+                    "$ref": "#/definitions/Transaction"
+                },
+                "tx_hash": {
+                    "type": "string"
                 }
             }
         }
