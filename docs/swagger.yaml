@@ -2138,7 +2138,7 @@ paths:
       summary: Get Pending Events
       tags:
       - events
-  /api/v3/pendingTransasctions:
+  /api/v3/pendingTransactions:
     get:
       consumes:
       - application/json

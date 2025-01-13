@@ -1795,7 +1795,7 @@ const docTemplate = `{
                 }
             }
         },
-        "/api/v3/pendingTransasctions": {
+        "/api/v3/pendingTransactions": {
             "get": {
                 "security": [
                     {
