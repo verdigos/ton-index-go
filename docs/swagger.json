@@ -1741,6 +1741,52 @@
                 }
             }
         },
+        "/api/v3/pendingActions": {
+            "get": {
+                "security": [
+                    {
+                        "APIKeyHeader": []
+                    },
+                    {
+                        "APIKeyQuery": []
+                    }
+                ],
+                "description": "Get actions by specified filter.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "events"
+                ],
+                "summary": "Get Pending Actions",
+                "operationId": "api_v3_get_pending_actions",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "List of account addresses to get actions. Can be sent in hex, base64 or base64url form.",
+                        "name": "account",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/ActionsResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/RequestError"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v3/pendingEvents": {
             "get": {
                 "security": [
