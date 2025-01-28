@@ -285,7 +285,7 @@ func ParseRawAction(raw *RawAction) (*Action, error) {
 	act.Type = raw.Type
 
 	switch act.Type {
-	case "call_contract":
+	case "call_contract", "contract_deploy":
 		var details ActionDetailsCallContract
 		details.OpCode = raw.Opcode
 		details.Source = raw.Source
