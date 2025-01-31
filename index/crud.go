@@ -8,24 +8,20 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/lib/pq"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/xssnick/tonutils-go/address"
 )
 
 // utils
-func getAccountAddressFriendly(account string, code_hash *string, account_status *string, is_testnet bool) string {
+func getAccountAddressFriendly(account string, code_hash *string, is_testnet bool) string {
 	addr, err := address.ParseRawAddr(strings.Trim(account, " "))
 	if err != nil {
 		return "addr_none"
 	}
 	bouncable := true
-	if code_hash == nil {
-		bouncable = false
-	}
-	if account_status != nil && *account_status == "uninit" {
-		bouncable = false
-	}
-	if code_hash != nil && WalletsHashMap[*code_hash] {
+	if code_hash == nil || WalletsHashMap[*code_hash] {
 		bouncable = false
 	}
 	addr.SetBounce(bouncable)
@@ -136,7 +132,18 @@ func buildTransactionsQuery(
 	lim_req LimitRequest,
 	settings RequestSettings,
 ) (string, error) {
-	query := `select T.* from`
+	query := `select T.account, T.hash, T.lt, T.block_workchain, T.block_shard, T.block_seqno, T.mc_block_seqno, T.trace_id, 
+	T.prev_trans_hash, T.prev_trans_lt, T.now, T.orig_status, T.end_status, T.total_fees, T.total_fees_extra_currencies, 
+	T.account_state_hash_before, T.account_state_hash_after, T.descr, T.aborted, T.destroyed, T.credit_first, T.is_tock, 
+	T.installed, T.storage_fees_collected, T.storage_fees_due, T.storage_status_change, T.credit_due_fees_collected, T.credit, 
+	T.credit_extra_currencies, T.compute_skipped, T.skipped_reason, T.compute_success, T.compute_msg_state_used, T.compute_account_activated, 
+	T.compute_gas_fees, T.compute_gas_used, T.compute_gas_limit, T.compute_gas_credit, T.compute_mode, T.compute_exit_code, T.compute_exit_arg, 
+	T.compute_vm_steps, T.compute_vm_init_state_hash, T.compute_vm_final_state_hash, T.action_success, T.action_valid, T.action_no_funds, 
+	T.action_status_change, T.action_total_fwd_fees, T.action_total_action_fees, T.action_result_code, T.action_result_arg, 
+	T.action_tot_actions, T.action_spec_actions, T.action_skipped_actions, T.action_msgs_created, T.action_action_list_hash, 
+	T.action_tot_msg_size_cells, T.action_tot_msg_size_bits, T.bounce, T.bounce_msg_size_cells, T.bounce_msg_size_bits, 
+	T.bounce_req_fwd_fees, T.bounce_msg_fees, T.bounce_fwd_fees, T.split_info_cur_shard_pfx_len, T.split_info_acc_split_depth, 
+	T.split_info_this_addr, T.split_info_sibling_addr from`
 	from_query := ` transactions as T`
 	filter_list := []string{}
 	filter_query := ``
@@ -209,6 +216,7 @@ func buildTransactionsQuery(
 			filter_list = append(filter_list, fmt.Sprintf("T.account in (%s)", vv_str))
 		}
 	}
+	// TODO: implement ExcludeAccount logic
 	if v := tx_req.Hash; v != nil {
 		filter_list = append(filter_list, fmt.Sprintf("T.hash = '%s'", *v))
 		orderby_query = ``
@@ -278,11 +286,14 @@ func buildMessagesQuery(
 	lim_req LimitRequest,
 	settings RequestSettings,
 ) (string, error) {
-	all_columns := ` M.*, B.*, I.*`
-	clmn_query := ` distinct on (M.created_lt, M.msg_hash)` + all_columns
-	from_query := ` messages as M 
-		left join message_contents as B on M.body_hash = B.hash 
-		left join message_contents as I on M.init_state_hash = I.hash`
+	rest_columns := `M.trace_id, M.source, M.destination, M.value, 
+		M.value_extra_currencies, M.fwd_fee, M.ihr_fee, M.created_lt, M.created_at, M.opcode, M.ihr_disabled, M.bounce, 
+		M.bounced, M.import_fee, M.body_hash, M.init_state_hash`
+	clmn_query := `'', 0, M.msg_hash, '', ` + rest_columns + `, 
+		max(case when M.direction='in' then M.tx_hash else null end) as in_tx_hash, 
+		max(case when M.direction='out' then M.tx_hash else null end) as out_tx_hash`
+	from_query := ` messages as M `
+	groupby_query := ` group by M.msg_hash, ` + rest_columns
 	filter_list := []string{}
 	filter_query := ``
 	orderby_query := ``
@@ -291,11 +302,8 @@ func buildMessagesQuery(
 		return "", err
 	}
 
-	with_distinct := true
 	if v := msg_req.Direction; v != nil {
 		filter_list = append(filter_list, fmt.Sprintf("M.direction = '%s'", *v))
-		clmn_query = all_columns
-		with_distinct = false
 	}
 	if v := msg_req.Source; v != nil {
 		if *v == "null" {
@@ -347,6 +355,12 @@ func buildMessagesQuery(
 	if v := lt_req.EndLt; v != nil {
 		filter_list = append(filter_list, fmt.Sprintf("M.created_lt <= %d", *v))
 	}
+	if v := msg_req.ExcludeExternals; v != nil && *v {
+		filter_list = append(filter_list, order_col+" is not NULL")
+	}
+	if v := msg_req.OnlyExternals; v != nil && *v {
+		filter_list = append(filter_list, order_col+" is NULL")
+	}
 
 	sort_order := "desc"
 	if lim_req.Sort != nil {
@@ -355,20 +369,21 @@ func buildMessagesQuery(
 			return "", err
 		}
 	}
-	if with_distinct {
-		clmn_query = ` distinct on (` + order_col + `, M.msg_hash)` + all_columns
-	}
-	orderby_query = fmt.Sprintf(" order by %s %s, M.msg_hash asc", order_col, sort_order)
+	orderby_query = fmt.Sprintf(" order by %s %s, M.msg_hash %s", order_col, sort_order, sort_order)
 
 	// build query
 	if len(filter_list) > 0 {
 		filter_query = ` where ` + strings.Join(filter_list, " and ")
 	}
-	query := `select` + clmn_query
-	query += ` from ` + from_query
-	query += filter_query
-	query += orderby_query
-	query += limit_query
+	inner_query := `select` + clmn_query
+	inner_query += ` from ` + from_query
+	inner_query += filter_query
+	inner_query += groupby_query
+	inner_query += orderby_query
+	inner_query += limit_query
+	query := `select MM.*, B.*, I.* from (` + inner_query + `) as MM 
+	left join message_contents as B on MM.body_hash = B.hash
+	left join message_contents as I on MM.init_state_hash = I.hash;`
 	// log.Println(query) // TODO: remove debug
 	return query, nil
 }
@@ -765,9 +780,32 @@ func buildActionsQuery(act_req ActionRequest, utime_req UtimeRequest, lt_req LtR
 		((A.jetton_swap_data).dex_outgoing_transfer).destination, ((A.jetton_swap_data).dex_outgoing_transfer).source_jetton_wallet,
 		((A.jetton_swap_data).dex_outgoing_transfer).destination_jetton_wallet, (A.jetton_swap_data).peer_swaps,
 		(A.change_dns_record_data).key, (A.change_dns_record_data).value_schema, (A.change_dns_record_data).value,
-		(A.change_dns_record_data).flags, (A.nft_mint_data).nft_item_index, A.success`
+		(A.change_dns_record_data).flags, (A.nft_mint_data).nft_item_index,
+		(A.dex_withdraw_liquidity_data).dex,
+		(A.dex_withdraw_liquidity_data).amount1,
+		(A.dex_withdraw_liquidity_data).amount2,
+		(A.dex_withdraw_liquidity_data).asset1_out,
+		(A.dex_withdraw_liquidity_data).asset2_out,
+		(A.dex_withdraw_liquidity_data).user_jetton_wallet_1,
+		(A.dex_withdraw_liquidity_data).user_jetton_wallet_2,
+		(A.dex_withdraw_liquidity_data).dex_jetton_wallet_1,
+		(A.dex_withdraw_liquidity_data).dex_jetton_wallet_2,
+		(A.dex_withdraw_liquidity_data).lp_tokens_burnt,
+		(A.dex_deposit_liquidity_data).dex,
+		(A.dex_deposit_liquidity_data).amount1,
+		(A.dex_deposit_liquidity_data).amount2,
+		(A.dex_deposit_liquidity_data).asset1,
+		(A.dex_deposit_liquidity_data).asset2,
+		(A.dex_deposit_liquidity_data).user_jetton_wallet_1,
+		(A.dex_deposit_liquidity_data).user_jetton_wallet_2,
+		(A.dex_deposit_liquidity_data).lp_tokens_minted,
+		(A.staking_data).provider,
+		(A.staking_data).ts_nft,
+		A.success,
+		A.trace_external_hash,
+		A.value_extra_currencies`
 	clmn_query := clmn_query_default
-	from_query := `actions as A join traces as E on A.trace_id = E.trace_id`
+	from_query := `actions as A`
 	filter_list := []string{}
 	filter_query := ``
 	orderby_query := ``
@@ -785,29 +823,49 @@ func buildActionsQuery(act_req ActionRequest, utime_req UtimeRequest, lt_req LtR
 	}
 	// time
 	order_by_now := false
+	join_accounts := false
+	if v := act_req.AccountAddress; v != nil && len(*v) > 0 {
+		join_accounts = true
+	}
 	if v := utime_req.StartUtime; v != nil {
-		filter_list = append(filter_list, fmt.Sprintf("E.end_utime >= %d", *v))
+		field := "A.trace_end_utime"
+		if join_accounts {
+			field = "AA.trace_end_utime"
+		}
+		filter_list = append(filter_list, fmt.Sprintf("%s >= %d", field, *v))
 		order_by_now = true
 	}
 	if v := utime_req.EndUtime; v != nil {
-		filter_list = append(filter_list, fmt.Sprintf("E.end_utime <= %d", *v))
+		field := "A.trace_end_utime"
+		if join_accounts {
+			field = "AA.trace_end_utime"
+		}
+		filter_list = append(filter_list, fmt.Sprintf("%s <= %d", field, *v))
 		order_by_now = true
 	}
 	if v := lt_req.StartLt; v != nil {
-		filter_list = append(filter_list, fmt.Sprintf("E.end_lt >= %d", *v))
+		field := "A.trace_end_lt"
+		if join_accounts {
+			field = "AA.trace_end_lt"
+		}
+		filter_list = append(filter_list, fmt.Sprintf("%s >= %d", field, *v))
 	}
 	if v := lt_req.EndLt; v != nil {
-		filter_list = append(filter_list, fmt.Sprintf("E.end_lt <= %d", *v))
+		field := "A.trace_end_lt"
+		if join_accounts {
+			field = "AA.trace_end_lt"
+		}
+		filter_list = append(filter_list, fmt.Sprintf("%s <= %d", field, *v))
 	}
 	if v := act_req.AccountAddress; v != nil && len(*v) > 0 {
-		filter_str := fmt.Sprintf("T.account = '%s'", *v)
+		filter_str := fmt.Sprintf("AA.account = '%s'::tonaddr", *v)
 		filter_list = append(filter_list, filter_str)
 
-		from_query = `actions as A join traces as E on E.trace_id = A.trace_id join transactions as T on E.trace_id = T.trace_id and A.tx_hashes @> array[T.hash::tonhash]`
+		from_query = `action_accounts as AA join actions as A on A.trace_id = AA.trace_id and A.action_id = AA.action_id`
 		if order_by_now {
-			clmn_query = `distinct on (E.end_utime, E.trace_id, A.end_utime, A.action_id) ` + clmn_query_default
+			clmn_query = `distinct on (AA.trace_end_utime, AA.trace_id, AA.action_end_utime, AA.action_id) ` + clmn_query_default
 		} else {
-			clmn_query = `distinct on (E.end_lt, E.trace_id, A.end_lt, A.action_id) ` + clmn_query_default
+			clmn_query = `distinct on (AA.trace_end_lt, AA.trace_id, AA.action_end_lt, AA.action_id) ` + clmn_query_default
 		}
 	}
 	if v := act_req.TransactionHash; v != nil {
@@ -815,11 +873,11 @@ func buildActionsQuery(act_req ActionRequest, utime_req UtimeRequest, lt_req LtR
 		if len(filter_str) > 0 {
 			filter_list = append(filter_list, filter_str)
 		}
-		from_query = `actions as A join traces as E on E.trace_id = A.trace_id join transactions as T on E.trace_id = T.trace_id and A.tx_hashes @> array[T.hash::tonhash]`
+		from_query = `actions as A join transactions as T on A.trace_id = T.trace_id and A.tx_hashes @> array[T.hash::tonhash]`
 		if order_by_now {
-			clmn_query = `distinct on (E.end_utime, E.trace_id, A.end_utime, A.action_id) ` + clmn_query_default
+			clmn_query = `distinct on (A.trace_end_utime, A.trace_id, A.end_utime, A.action_id) ` + clmn_query_default
 		} else {
-			clmn_query = `distinct on (E.end_lt, E.trace_id, A.end_lt, A.action_id) ` + clmn_query_default
+			clmn_query = `distinct on (A.trace_end_lt, A.trace_id, A.end_lt, A.action_id) ` + clmn_query_default
 		}
 	}
 	if v := act_req.MessageHash; v != nil {
@@ -828,11 +886,22 @@ func buildActionsQuery(act_req ActionRequest, utime_req UtimeRequest, lt_req LtR
 			filter_list = append(filter_list, filter_str)
 		}
 		from_query = `actions as A join messages as M on A.trace_id = M.trace_id and array[M.tx_hash::tonhash] @> A.tx_hashes`
-		from_query = `actions as A join traces as E on E.trace_id = A.trace_id join messages as M on E.trace_id = T.trace_id and A.tx_hashes @> array[T.hash::tonhash]`
 		if order_by_now {
-			clmn_query = `distinct on (E.end_utime, E.trace_id, A.end_utime, A.action_id) ` + clmn_query_default
+			clmn_query = `distinct on (A.trace_end_utime, A.trace_id, A.end_utime, A.action_id) ` + clmn_query_default
 		} else {
-			clmn_query = `distinct on (E.end_lt, E.trace_id, A.end_lt, A.action_id) ` + clmn_query_default
+			clmn_query = `distinct on (A.trace_end_lt, A.trace_id, A.end_lt, A.action_id) ` + clmn_query_default
+		}
+	}
+	if v := act_req.IncludeActionTypes; len(v) > 0 {
+		filter_str := filterByArray("A.type", v)
+		if len(filter_str) > 0 {
+			filter_list = append(filter_list, filter_str)
+		}
+	}
+	if v := act_req.ExcludeActionTypes; len(v) > 0 {
+		filter_str := filterByArray("A.type", v)
+		if len(filter_str) > 0 {
+			filter_list = append(filter_list, fmt.Sprintf("not (%s)", filter_str))
 		}
 	}
 	if v := act_req.McSeqno; v != nil {
@@ -842,26 +911,38 @@ func buildActionsQuery(act_req ActionRequest, utime_req UtimeRequest, lt_req LtR
 		clmn_query = clmn_query_default
 	}
 	if v := act_req.ActionId; v != nil {
+		from_query = `actions as A`
 		filter_str := filterByArray("A.action_id", v)
 		if len(filter_str) > 0 {
 			filter_list = []string{filter_str}
 		}
-		from_query = `actions as A`
 		clmn_query = clmn_query_default
 	}
 	if v := act_req.TraceId; v != nil {
+		from_query = `actions as A`
 		filter_str := filterByArray("A.trace_id", v)
 		if len(filter_str) > 0 {
 			filter_list = []string{filter_str}
 		}
 	}
-
-	if order_by_now {
-		orderby_query = fmt.Sprintf(" order by E.end_utime %s, E.trace_id %s, A.end_utime %s, A.action_id %s", sort_order, sort_order, sort_order, sort_order)
+	if strings.Contains(from_query, "action_accounts") {
+		if order_by_now {
+			orderby_query = fmt.Sprintf(" order by AA.trace_end_utime %s, AA.trace_id %s, AA.action_end_utime %s, AA.action_id %s",
+				sort_order, sort_order, sort_order, sort_order)
+		} else {
+			orderby_query = fmt.Sprintf(" order by AA.trace_end_lt %s, AA.trace_id %s, AA.action_end_lt %s, AA.action_id %s",
+				sort_order, sort_order, sort_order, sort_order)
+		}
 	} else {
-		orderby_query = fmt.Sprintf(" order by E.end_lt %s, E.trace_id %s, A.end_lt %s, A.action_id %s", sort_order, sort_order, sort_order, sort_order)
+		if order_by_now {
+			orderby_query = fmt.Sprintf(" order by A.trace_end_utime %s, A.trace_id %s, A.end_utime %s, A.action_id %s",
+				sort_order, sort_order, sort_order, sort_order)
+		} else {
+			orderby_query = fmt.Sprintf(" order by A.trace_end_lt %s, A.trace_id %s, A.end_lt %s, A.action_id %s",
+				sort_order, sort_order, sort_order, sort_order)
+		}
 	}
-
+	filter_list = append(filter_list, "A.end_lt is not NULL")
 	// build query
 	if len(filter_list) > 0 {
 		filter_query = ` where ` + strings.Join(filter_list, " and ")
@@ -875,7 +956,7 @@ func buildActionsQuery(act_req ActionRequest, utime_req UtimeRequest, lt_req LtR
 	return query, nil
 }
 
-func buildEventsQuery(event_req EventRequest, utime_req UtimeRequest, lt_req LtRequest, lim_req LimitRequest, settings RequestSettings) (string, error) {
+func buildTracesQuery(trace_req TracesRequest, utime_req UtimeRequest, lt_req LtRequest, lim_req LimitRequest, settings RequestSettings) (string, error) {
 	clmn_query_default := `E.trace_id, E.external_hash, E.mc_seqno_start, E.mc_seqno_end, 
 						   E.start_lt, E.start_utime, E.end_lt, E.end_utime, 
 						   E.state, E.edges_, E.nodes_, E.pending_edges_, E.classification_state`
@@ -920,7 +1001,7 @@ func buildEventsQuery(event_req EventRequest, utime_req UtimeRequest, lt_req LtR
 		orderby_query = fmt.Sprintf(" order by E.end_lt %s, E.trace_id %s", sort_order, sort_order)
 	}
 
-	if v := event_req.AccountAddress; v != nil && len(*v) > 0 {
+	if v := trace_req.AccountAddress; v != nil && len(*v) > 0 {
 		filter_str := fmt.Sprintf("T.account = '%s'", *v)
 		filter_list = append(filter_list, filter_str)
 
@@ -931,7 +1012,7 @@ func buildEventsQuery(event_req EventRequest, utime_req UtimeRequest, lt_req LtR
 			clmn_query = `distinct on (E.end_lt, E.trace_id) ` + clmn_query_default
 		}
 	}
-	if v := event_req.TransactionHash; v != nil {
+	if v := trace_req.TransactionHash; v != nil {
 		filter_str := filterByArray("T.hash", v)
 		if len(filter_str) > 0 {
 			filter_list = append(filter_list, filter_str)
@@ -944,7 +1025,7 @@ func buildEventsQuery(event_req EventRequest, utime_req UtimeRequest, lt_req LtR
 			clmn_query = `distinct on (E.end_lt, E.trace_id) ` + clmn_query_default
 		}
 	}
-	if v := event_req.MessageHash; v != nil {
+	if v := trace_req.MessageHash; v != nil {
 		filter_str := filterByArray("M.msg_hash", v)
 		if len(filter_str) > 0 {
 			filter_list = append(filter_list, filter_str)
@@ -958,13 +1039,13 @@ func buildEventsQuery(event_req EventRequest, utime_req UtimeRequest, lt_req LtR
 		}
 	}
 
-	if v := event_req.TraceId; v != nil {
+	if v := trace_req.TraceId; v != nil {
 		filter_str := filterByArray("E.trace_id", v)
 		if len(filter_str) > 0 {
 			filter_list = append(filter_list, filter_str)
 		}
 	}
-	if v := event_req.McSeqno; v != nil {
+	if v := trace_req.McSeqno; v != nil {
 		filter_list = append(filter_list, `E.state = 'complete'`)
 		filter_list = append(filter_list, fmt.Sprintf("E.mc_seqno_end = %d", *v))
 	}
@@ -1051,7 +1132,7 @@ func buildJettonBurnsQuery(burn_req JettonBurnRequest, utime_req UtimeRequest,
 }
 
 func buildAccountStatesQuery(account_req AccountRequest, lim_req LimitRequest, settings RequestSettings) (string, error) {
-	clmn_query_default := `A.account, A.hash, A.balance, A.account_status, A.frozen_hash, A.last_trans_hash, A.last_trans_lt, A.data_hash, A.code_hash, `
+	clmn_query_default := `A.account, A.hash, A.balance, A.balance_extra_currencies, A.account_status, A.frozen_hash, A.last_trans_hash, A.last_trans_lt, A.data_hash, A.code_hash, `
 	clmn_query := clmn_query_default + `A.data_boc, A.code_boc`
 	from_query := `latest_account_states as A`
 	filter_list := []string{}
@@ -1219,7 +1300,9 @@ func queryTransactionsImpl(query string, conn *pgxpool.Conn, settings RequestSet
 	}
 	if len(acst_list) > 0 {
 		acst_list_str := strings.Join(acst_list, ",")
-		query = fmt.Sprintf("select * from account_states where hash in (%s)", acst_list_str)
+		query = fmt.Sprintf(`select S.hash, S.account, S.balance, 
+		S.balance_extra_currencies, S.account_status, S.frozen_hash, 
+		S.data_hash, S.code_hash from account_states S where hash in (%s)`, acst_list_str)
 
 		acsts, err := queryAccountStatesImpl(query, conn, settings)
 		if err != nil {
@@ -1242,7 +1325,9 @@ func queryTransactionsImpl(query string, conn *pgxpool.Conn, settings RequestSet
 	// messages
 	if len(hash_list) > 0 {
 		hash_list_str := strings.Join(hash_list, ",")
-		query = fmt.Sprintf(`select M.*, B.*, I.* from messages as M 
+		query = fmt.Sprintf(`select M.tx_hash, M.tx_lt, M.msg_hash, M.direction, M.trace_id, M.source, M.destination, M.value, 
+			M.value_extra_currencies, M.fwd_fee, M.ihr_fee, M.created_lt, M.created_at, M.opcode, M.ihr_disabled, M.bounce, 
+			M.bounced, M.import_fee, M.body_hash, M.init_state_hash, NULL, NULL, B.*, I.* from messages as M 
 			left join message_contents as B on M.body_hash = B.hash 
 			left join message_contents as I on M.init_state_hash = I.hash
 			where M.tx_hash in (%s)`, hash_list_str)
@@ -1312,6 +1397,71 @@ func queryAdjacentTransactionsImpl(req AdjacentTransactionRequest, conn *pgxpool
 	return txs, nil
 }
 
+func queryMetadataImpl(addr_list []string, conn *pgxpool.Conn, settings RequestSettings) (Metadata, error) {
+	query := "select n.address, m.valid, 'nft_items' as type, m.name, m.symbol, m.description, m.image, m.extra from nft_items n left join address_metadata m on n.address = m.address and m.type = 'nft_items' where n.address = ANY($1)" +
+		" union all " +
+		"select c.address, m.valid, 'nft_collections' as type, m.name, m.symbol, m.description, m.image, m.extra  from nft_collections c left join address_metadata m on c.address = m.address and m.type = 'nft_collections' where c.address = ANY($1)" +
+		" union all " +
+		"select j.address, m.valid, 'jetton_masters' as type, m.name, m.symbol, m.description, m.image, m.extra  from jetton_masters j left join address_metadata m on j.address = m.address and m.type = 'jetton_masters' where j.address = ANY($1)"
+
+	ctx, cancel_ctx := context.WithTimeout(context.Background(), settings.Timeout)
+	defer cancel_ctx()
+	rows, err := conn.Query(ctx, query, pq.Array(addr_list))
+	if err != nil {
+		return nil, IndexError{Code: 500, Message: err.Error()}
+	}
+
+	defer rows.Close()
+
+	tasks := []BackgroundTask{}
+	token_info_map := map[string][]TokenInfo{}
+
+	for rows.Next() {
+		var row TokenInfo
+		err := rows.Scan(&row.Address, &row.Valid, &row.Type, &row.Name, &row.Symbol, &row.Description, &row.Image, &row.Extra)
+		if err != nil {
+			return nil, IndexError{Code: 500, Message: err.Error()}
+		}
+		if row.Valid == nil {
+			data := map[string]interface{}{
+				"address": row.Address,
+				"type":    row.Type,
+			}
+			tasks = append(tasks, BackgroundTask{Type: "fetch_metadata", Data: data})
+			token_info_map[row.Address] = append(token_info_map[row.Address], TokenInfo{
+				Address: row.Address,
+				Type:    row.Type,
+				Indexed: false,
+			})
+		} else if *row.Valid {
+			row.Indexed = true
+
+			if _, ok := token_info_map[*row.Type]; !ok {
+				token_info_map[row.Address] = []TokenInfo{}
+			}
+			token_info_map[row.Address] = append(token_info_map[row.Address], row)
+		} else {
+			token_info_map[row.Address] = []TokenInfo{}
+		}
+	}
+	metadata := Metadata{}
+	for addr, infos := range token_info_map {
+		indexed := true
+		for _, info := range infos {
+			indexed = indexed && info.Indexed
+		}
+		metadata[addr] = AddressMetadata{
+			TokenInfo: infos,
+			IsIndexed: indexed,
+		}
+	}
+
+	if len(tasks) > 0 && BackgroundTaskManager != nil {
+		BackgroundTaskManager.EnqueueTasksIfPossible(tasks)
+	}
+	return metadata, nil
+}
+
 func queryAddressBookImpl(addr_list []string, conn *pgxpool.Conn, settings RequestSettings) (AddressBook, error) {
 	book := AddressBook{}
 	quote_addr_list := []string{}
@@ -1322,7 +1472,14 @@ func queryAddressBookImpl(addr_list []string, conn *pgxpool.Conn, settings Reque
 	{
 		addr_list_str := strings.Join(quote_addr_list, ",")
 
-		query := fmt.Sprintf("select account, account_friendly, code_hash, account_status from latest_account_states where account in (%s)", addr_list_str)
+		query := fmt.Sprintf(`SELECT DISTINCT ON (las.account) las.account, las.code_hash, dns.domain FROM
+  								latest_account_states las
+							LEFT JOIN
+  								dns_entries dns ON las.account = dns.dns_wallet AND dns.dns_wallet = dns.nft_item_owner
+							WHERE
+								las.account IN (%s)
+							ORDER BY
+								las.account, LENGTH(dns.domain) ASC`, addr_list_str)
 
 		ctx, cancel_ctx := context.WithTimeout(context.Background(), settings.Timeout)
 		defer cancel_ctx()
@@ -1340,12 +1497,11 @@ func queryAddressBookImpl(addr_list []string, conn *pgxpool.Conn, settings Reque
 		book_tmp := AddressBook{}
 		for rows.Next() {
 			var account string
-			var account_friendly *string
 			var code_hash *string
-			var account_status *string
-			if err := rows.Scan(&account, &account_friendly, &code_hash, &account_status); err == nil {
-				addr_str := getAccountAddressFriendly(account, code_hash, account_status, settings.IsTestnet)
-				book_tmp[strings.Trim(account, " ")] = AddressBookRow{UserFriendly: &addr_str}
+			var domain *string
+			if err := rows.Scan(&account, &code_hash, &domain); err == nil {
+				addr_str := getAccountAddressFriendly(account, code_hash, settings.IsTestnet)
+				book_tmp[strings.Trim(account, " ")] = AddressBookRow{UserFriendly: &addr_str, Domain: domain}
 			} else {
 				return nil, IndexError{Code: 500, Message: err.Error()}
 			}
@@ -1363,8 +1519,8 @@ func queryAddressBookImpl(addr_list []string, conn *pgxpool.Conn, settings Reque
 			if rec, ok := book_tmp[account]; ok {
 				book[addr] = rec
 			} else {
-				addr_str := getAccountAddressFriendly(account, nil, nil, settings.IsTestnet)
-				book[addr] = AddressBookRow{UserFriendly: &addr_str}
+				addr_str := getAccountAddressFriendly(account, nil, settings.IsTestnet)
+				book[addr] = AddressBookRow{UserFriendly: &addr_str, Domain: nil}
 			}
 		}
 	}
@@ -1767,8 +1923,8 @@ func collectAddressesFromTransactions(addr_list *map[string]bool, tx *Transactio
 	return success
 }
 
-func queryEventsImpl(query string, conn *pgxpool.Conn, settings RequestSettings) ([]Event, []string, error) {
-	events := []Event{}
+func queryTracesImpl(query string, includeActions bool, conn *pgxpool.Conn, settings RequestSettings) ([]Trace, []string, error) {
+	traces := []Trace{}
 	{
 		ctx, cancel_ctx := context.WithTimeout(context.Background(), settings.Timeout)
 		defer cancel_ctx()
@@ -1779,9 +1935,9 @@ func queryEventsImpl(query string, conn *pgxpool.Conn, settings RequestSettings)
 		defer rows.Close()
 
 		for rows.Next() {
-			if loc, err := ScanEvent(rows); err == nil {
+			if loc, err := ScanTrace(rows); err == nil {
 				loc.Transactions = make(map[HashType]*Transaction)
-				events = append(events, *loc)
+				traces = append(traces, *loc)
 			} else {
 				return nil, nil, IndexError{Code: 500, Message: err.Error()}
 			}
@@ -1790,20 +1946,20 @@ func queryEventsImpl(query string, conn *pgxpool.Conn, settings RequestSettings)
 			return nil, nil, IndexError{Code: 500, Message: rows.Err().Error()}
 		}
 	}
-	events_map := map[HashType]int{}
+	traces_map := map[HashType]int{}
 	trace_id_list := []HashType{}
 	addr_map := map[string]bool{}
-	for idx := range events {
-		events_map[events[idx].TraceId] = idx
-		if settings.MaxEventTransactions > 0 && events[idx].EventMeta.Transactions > int64(settings.MaxEventTransactions) {
-			events[idx].IsIncomplete = true
-			events[idx].Warning = "event is too large"
+	for idx := range traces {
+		traces_map[traces[idx].TraceId] = idx
+		if settings.MaxTraceTransactions > 0 && traces[idx].TraceMeta.Transactions > int64(settings.MaxTraceTransactions) {
+			traces[idx].IsIncomplete = true
+			traces[idx].Warning = "trace is too large"
 		} else {
-			trace_id_list = append(trace_id_list, events[idx].TraceId)
+			trace_id_list = append(trace_id_list, traces[idx].TraceId)
 		}
 	}
 	if len(trace_id_list) > 0 {
-		{
+		if includeActions {
 			query := `select A.trace_id, A.action_id, A.start_lt, A.end_lt, A.start_utime, A.end_utime, A.source, A.source_secondary,
 				A.destination, A.destination_secondary, A.asset, A.asset_secondary, A.asset2, A.asset2_secondary, A.opcode, A.tx_hashes,
 				A.type, (A.ton_transfer_data).content, (A.ton_transfer_data).encrypted, A.value, A.amount,
@@ -1821,10 +1977,36 @@ func queryEventsImpl(query string, conn *pgxpool.Conn, settings RequestSettings)
 				((A.jetton_swap_data).dex_outgoing_transfer).destination_jetton_wallet, (A.jetton_swap_data).peer_swaps,
 				(A.change_dns_record_data).key, (A.change_dns_record_data).value_schema, (A.change_dns_record_data).value,
 				(A.change_dns_record_data).flags, (A.nft_mint_data).nft_item_index,
-				A.success from actions as A where ` + filterByArray("A.trace_id", trace_id_list) + ` order by trace_id, start_lt, end_lt`
+				(A.dex_withdraw_liquidity_data).dex,
+				(A.dex_withdraw_liquidity_data).amount1,
+				(A.dex_withdraw_liquidity_data).amount2,
+				(A.dex_withdraw_liquidity_data).asset1_out,
+				(A.dex_withdraw_liquidity_data).asset2_out,
+				(A.dex_withdraw_liquidity_data).user_jetton_wallet_1,
+				(A.dex_withdraw_liquidity_data).user_jetton_wallet_2,
+				(A.dex_withdraw_liquidity_data).dex_jetton_wallet_1,
+				(A.dex_withdraw_liquidity_data).dex_jetton_wallet_2,
+				(A.dex_withdraw_liquidity_data).lp_tokens_burnt,
+				(A.dex_deposit_liquidity_data).dex,
+				(A.dex_deposit_liquidity_data).amount1,
+				(A.dex_deposit_liquidity_data).amount2,
+				(A.dex_deposit_liquidity_data).asset1,
+				(A.dex_deposit_liquidity_data).asset2,
+				(A.dex_deposit_liquidity_data).user_jetton_wallet_1,
+				(A.dex_deposit_liquidity_data).user_jetton_wallet_2,
+				(A.dex_deposit_liquidity_data).lp_tokens_minted,
+				(A.staking_data).provider,
+				(A.staking_data).ts_nft,
+				A.success, A.trace_external_hash, A.value_extra_currencies from actions as A where ` + filterByArray("A.trace_id", trace_id_list) + ` order by trace_id, start_lt, end_lt`
 			actions, err := queryRawActionsImpl(query, conn, settings)
 			if err != nil {
 				return nil, nil, IndexError{Code: 500, Message: fmt.Sprintf("failed query actions: %s", err.Error())}
+			}
+			for idx := range traces {
+				if traces[idx].Actions == nil {
+					new_actions := make([]*Action, 0)
+					traces[idx].Actions = &new_actions
+				}
 			}
 			for idx := range actions {
 				raw_action := &actions[idx]
@@ -1835,11 +2017,22 @@ func queryEventsImpl(query string, conn *pgxpool.Conn, settings RequestSettings)
 				if err != nil {
 					return nil, nil, IndexError{Code: 500, Message: fmt.Sprintf("failed to parse action: %s", err.Error())}
 				}
-				events[events_map[action.TraceId]].Actions = append(events[events_map[action.TraceId]].Actions, action)
+				*traces[traces_map[action.TraceId]].Actions = append(*traces[traces_map[action.TraceId]].Actions, action)
 			}
 		}
 		{
-			query := `select T.* from transactions as T where ` + filterByArray("T.trace_id", trace_id_list) + ` order by trace_id, lt`
+			query := `select T.account, T.hash, T.lt, T.block_workchain, T.block_shard, T.block_seqno, T.mc_block_seqno, T.trace_id, 
+				T.prev_trans_hash, T.prev_trans_lt, T.now, T.orig_status, T.end_status, T.total_fees, T.total_fees_extra_currencies, 
+				T.account_state_hash_before, T.account_state_hash_after, T.descr, T.aborted, T.destroyed, T.credit_first, T.is_tock, 
+				T.installed, T.storage_fees_collected, T.storage_fees_due, T.storage_status_change, T.credit_due_fees_collected, T.credit, 
+				T.credit_extra_currencies, T.compute_skipped, T.skipped_reason, T.compute_success, T.compute_msg_state_used, T.compute_account_activated, 
+				T.compute_gas_fees, T.compute_gas_used, T.compute_gas_limit, T.compute_gas_credit, T.compute_mode, T.compute_exit_code, T.compute_exit_arg, 
+				T.compute_vm_steps, T.compute_vm_init_state_hash, T.compute_vm_final_state_hash, T.action_success, T.action_valid, T.action_no_funds, 
+				T.action_status_change, T.action_total_fwd_fees, T.action_total_action_fees, T.action_result_code, T.action_result_arg, 
+				T.action_tot_actions, T.action_spec_actions, T.action_skipped_actions, T.action_msgs_created, T.action_action_list_hash, 
+				T.action_tot_msg_size_cells, T.action_tot_msg_size_bits, T.bounce, T.bounce_msg_size_cells, T.bounce_msg_size_bits, 
+				T.bounce_req_fwd_fees, T.bounce_msg_fees, T.bounce_fwd_fees, T.split_info_cur_shard_pfx_len, T.split_info_acc_split_depth, 
+				T.split_info_this_addr, T.split_info_sibling_addr from transactions as T where ` + filterByArray("T.trace_id", trace_id_list) + ` order by trace_id, lt`
 			txs, err := queryTransactionsImpl(query, conn, settings)
 			if err != nil {
 				return nil, nil, IndexError{Code: 500, Message: fmt.Sprintf("failed query transactions: %s", err.Error())}
@@ -1849,26 +2042,26 @@ func queryEventsImpl(query string, conn *pgxpool.Conn, settings RequestSettings)
 
 				collectAddressesFromTransactions(&addr_map, tx)
 				if v := tx.TraceId; v != nil {
-					event := &events[events_map[*v]]
-					event.TransactionsOrder = append(event.TransactionsOrder, tx.Hash)
-					event.Transactions[tx.Hash] = tx
+					trace := &traces[traces_map[*v]]
+					trace.TransactionsOrder = append(trace.TransactionsOrder, tx.Hash)
+					trace.Transactions[tx.Hash] = tx
 				}
 			}
 		}
 	}
-	for idx := range events {
-		if len(events[idx].TransactionsOrder) > 0 {
-			trace, err := assembleEventTraceFromMap(&events[idx].TransactionsOrder, &events[idx].Transactions)
+	for idx := range traces {
+		if len(traces[idx].TransactionsOrder) > 0 {
+			trace, err := assembleTraceTxsFromMap(&traces[idx].TransactionsOrder, &traces[idx].Transactions)
 			if err != nil {
-				if len(events[idx].Warning) > 0 {
-					events[idx].Warning += ", " + err.Error()
+				if len(traces[idx].Warning) > 0 {
+					traces[idx].Warning += ", " + err.Error()
 				} else {
-					events[idx].Warning = err.Error()
+					traces[idx].Warning = err.Error()
 				}
 				// return nil, nil, IndexError{Code: 500, Message: fmt.Sprintf("failed to assemble trace: %s", err.Error())}
 			}
 			if trace != nil {
-				events[idx].Trace = trace
+				traces[idx].Trace = trace
 			}
 		}
 	}
@@ -1879,10 +2072,10 @@ func queryEventsImpl(query string, conn *pgxpool.Conn, settings RequestSettings)
 		addr_list = append(addr_list, k)
 	}
 
-	return events, addr_list, nil
+	return traces, addr_list, nil
 }
 
-func assembleEventTraceFromMap(tx_order *[]HashType, txs *map[HashType]*Transaction) (*TraceNode, error) {
+func assembleTraceTxsFromMap(tx_order *[]HashType, txs *map[HashType]*Transaction) (*TraceNode, error) {
 	nodes := map[HashType]*TraceNode{}
 	warning := ``
 	var root *TraceNode = nil
@@ -1981,6 +2174,26 @@ func (db *DbClient) QueryShards(
 	return queryBlocksImpl(query, conn, settings)
 }
 
+func (db *DbClient) QueryMetadata(
+	addr_list []string,
+	settings RequestSettings,
+) (Metadata, error) {
+	raw_addr_list := []string{}
+	for _, addr := range addr_list {
+		addr_loc := AccountAddressConverter(addr)
+		if addr_loc.IsValid() {
+			if v, ok := addr_loc.Interface().(AccountAddress); ok {
+				raw_addr_list = append(raw_addr_list, string(v))
+			}
+		}
+	}
+	conn, err := db.Pool.Acquire(context.Background())
+	if err != nil {
+		return nil, IndexError{Code: 500, Message: err.Error()}
+	}
+	return queryMetadataImpl(raw_addr_list, conn, settings)
+}
+
 func (db *DbClient) QueryAddressBook(
 	addr_list []string,
 	settings RequestSettings,
@@ -2013,9 +2226,8 @@ func (db *DbClient) QueryAddressBook(
 		if vv, ok := book[v]; ok {
 			new_addr_book[k] = vv
 		} else {
-			new_addr_book[k] = AddressBookRow{nil}
+			new_addr_book[k] = AddressBookRow{UserFriendly: nil, Domain: nil}
 		}
-
 	}
 	return new_addr_book, nil
 }
@@ -2110,7 +2322,18 @@ func (db *DbClient) QueryAdjacentTransactions(
 		tx_hash_list[idx] = fmt.Sprintf("'%s'", tx_hash_list[idx])
 	}
 	tx_hash_str := strings.Join(tx_hash_list, ",")
-	query := fmt.Sprintf("select * from transactions where hash in (%s) order by lt asc", tx_hash_str)
+	query := fmt.Sprintf(`select T.account, T.hash, T.lt, T.block_workchain, T.block_shard, T.block_seqno, T.mc_block_seqno, T.trace_id, 
+		T.prev_trans_hash, T.prev_trans_lt, T.now, T.orig_status, T.end_status, T.total_fees, T.total_fees_extra_currencies, 
+		T.account_state_hash_before, T.account_state_hash_after, T.descr, T.aborted, T.destroyed, T.credit_first, T.is_tock, 
+		T.installed, T.storage_fees_collected, T.storage_fees_due, T.storage_status_change, T.credit_due_fees_collected, T.credit, 
+		T.credit_extra_currencies, T.compute_skipped, T.skipped_reason, T.compute_success, T.compute_msg_state_used, T.compute_account_activated, 
+		T.compute_gas_fees, T.compute_gas_used, T.compute_gas_limit, T.compute_gas_credit, T.compute_mode, T.compute_exit_code, T.compute_exit_arg, 
+		T.compute_vm_steps, T.compute_vm_init_state_hash, T.compute_vm_final_state_hash, T.action_success, T.action_valid, T.action_no_funds, 
+		T.action_status_change, T.action_total_fwd_fees, T.action_total_action_fees, T.action_result_code, T.action_result_arg, 
+		T.action_tot_actions, T.action_spec_actions, T.action_skipped_actions, T.action_msgs_created, T.action_action_list_hash, 
+		T.action_tot_msg_size_cells, T.action_tot_msg_size_bits, T.bounce, T.bounce_msg_size_cells, T.bounce_msg_size_bits, 
+		T.bounce_req_fwd_fees, T.bounce_msg_fees, T.bounce_fwd_fees, T.split_info_cur_shard_pfx_len, T.split_info_acc_split_depth, 
+		T.split_info_this_addr, T.split_info_sibling_addr from transactions as T where hash in (%s) order by lt asc`, tx_hash_str)
 	txs, err := queryTransactionsImpl(query, conn, settings)
 	if err != nil {
 		return nil, nil, IndexError{Code: 500, Message: err.Error()}
@@ -2149,31 +2372,29 @@ func (db *DbClient) QueryMessages(
 	lt_req LtRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]Message, AddressBook, error) {
+) ([]Message, AddressBook, Metadata, error) {
 	query, err := buildMessagesQuery(msg_req, utime_req, lt_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	msgs, err := queryMessagesImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return msgs, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, m := range msgs {
 		if m.Source != nil {
@@ -2184,43 +2405,48 @@ func (db *DbClient) QueryMessages(
 		}
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return msgs, book, nil
+	return msgs, book, metadata, nil
 }
 
 func (db *DbClient) QueryNFTCollections(
 	nft_req NFTCollectionRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]NFTCollection, AddressBook, error) {
+) ([]NFTCollection, AddressBook, Metadata, error) {
 	query, err := buildNFTCollectionsQuery(nft_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	res, err := queryNFTCollectionsImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, t := range res {
 		addr_list = append(addr_list, string(t.Address))
@@ -2229,57 +2455,70 @@ func (db *DbClient) QueryNFTCollections(
 		}
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return res, book, nil
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryNFTItems(
 	nft_req NFTItemRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]NFTItem, AddressBook, error) {
+) ([]NFTItem, AddressBook, Metadata, error) {
 	query, err := buildNFTItemsQuery(nft_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	res, err := queryNFTItemsWithCollectionsImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, t := range res {
 		addr_list = append(addr_list, string(t.Address))
+		if t.CollectionAddress != nil {
+			addr_list = append(addr_list, string(*t.CollectionAddress))
+		}
 		if t.OwnerAddress != nil {
 			addr_list = append(addr_list, string(*t.OwnerAddress))
 		}
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return res, book, nil
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryNFTTransfers(
@@ -2288,31 +2527,29 @@ func (db *DbClient) QueryNFTTransfers(
 	lt_req LtRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]NFTTransfer, AddressBook, error) {
+) ([]NFTTransfer, AddressBook, Metadata, error) {
 	query, err := buildNFTTransfersQuery(transfer_req, utime_req, lt_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	res, err := queryNFTTransfersImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, t := range res {
 		addr_list = append(addr_list, string(t.NftItemAddress))
@@ -2324,43 +2561,47 @@ func (db *DbClient) QueryNFTTransfers(
 		}
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return res, book, nil
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryJettonMasters(
 	jetton_req JettonMasterRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]JettonMaster, AddressBook, error) {
+) ([]JettonMaster, AddressBook, Metadata, error) {
 	query, err := buildJettonMastersQuery(jetton_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	res, err := queryJettonMastersImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, t := range res {
 		addr_list = append(addr_list, string(t.Address))
@@ -2369,44 +2610,48 @@ func (db *DbClient) QueryJettonMasters(
 		}
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return res, book, nil
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryJettonWallets(
 	jetton_req JettonWalletRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]JettonWallet, AddressBook, error) {
+) ([]JettonWallet, AddressBook, Metadata, error) {
 	query, err := buildJettonWalletsQuery(jetton_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	res, err := queryJettonWalletsImpl(query, conn, settings)
 	if err != nil {
 		log.Println(query)
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, t := range res {
 		addr_list = append(addr_list, string(t.Address))
@@ -2414,12 +2659,18 @@ func (db *DbClient) QueryJettonWallets(
 		addr_list = append(addr_list, string(t.Jetton))
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return res, book, nil
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryJettonTransfers(
@@ -2428,31 +2679,29 @@ func (db *DbClient) QueryJettonTransfers(
 	lt_req LtRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]JettonTransfer, AddressBook, error) {
+) ([]JettonTransfer, AddressBook, Metadata, error) {
 	query, err := buildJettonTransfersQuery(transfer_req, utime_req, lt_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	res, err := queryJettonTransfersImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, t := range res {
 		addr_list = append(addr_list, string(t.Source))
@@ -2464,12 +2713,18 @@ func (db *DbClient) QueryJettonTransfers(
 		}
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return res, book, nil
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryJettonBurns(
@@ -2478,31 +2733,29 @@ func (db *DbClient) QueryJettonBurns(
 	lt_req LtRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]JettonBurn, AddressBook, error) {
+) ([]JettonBurn, AddressBook, Metadata, error) {
 	query, err := buildJettonBurnsQuery(transfer_req, utime_req, lt_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	res, err := queryJettonBurnsImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, t := range res {
 		addr_list = append(addr_list, string(t.Owner))
@@ -2513,43 +2766,47 @@ func (db *DbClient) QueryJettonBurns(
 		}
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return res, book, nil
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryAccountStates(
 	account_req AccountRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]AccountStateFull, AddressBook, error) {
+) ([]AccountStateFull, AddressBook, Metadata, error) {
 	query, err := buildAccountStatesQuery(account_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	res, err := queryAccountStateFullImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	addr_list := []string{}
 	for _, t := range res {
 		if t.AccountAddress != nil {
@@ -2557,32 +2814,39 @@ func (db *DbClient) QueryAccountStates(
 		}
 	}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return res, book, nil
+
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryWalletStates(
 	account_req AccountRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]WalletState, AddressBook, error) {
-	states, book, err := db.QueryAccountStates(account_req, lim_req, settings)
+) ([]WalletState, AddressBook, Metadata, error) {
+	states, book, metadata, err := db.QueryAccountStates(account_req, lim_req, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	res := []WalletState{}
 	for _, state := range states {
 		loc, err := ParseWalletState(state)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 		res = append(res, *loc)
 	}
-	return res, book, nil
+	return res, book, metadata, nil
 }
 
 func (db *DbClient) QueryTopAccountBalances(lim_req LimitRequest, settings RequestSettings) ([]AccountBalance, error) {
@@ -2606,26 +2870,25 @@ func (db *DbClient) QueryTopAccountBalances(lim_req LimitRequest, settings Reque
 	return res, nil
 }
 
-// events
 func (db *DbClient) QueryActions(
 	act_req ActionRequest,
 	utime_req UtimeRequest,
 	lt_req LtRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]Action, AddressBook, error) {
+) ([]Action, AddressBook, Metadata, error) {
 	query, err := buildActionsQuery(act_req, utime_req, lt_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
@@ -2633,25 +2896,26 @@ func (db *DbClient) QueryActions(
 	if seqno := act_req.McSeqno; seqno != nil {
 		exists, err := queryBlockExists(*seqno, conn, settings)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if !exists {
-			return nil, nil, IndexError{Code: 404, Message: fmt.Sprintf("masterchain block %d not found", *seqno)}
+			return nil, nil, nil, IndexError{Code: 404, Message: fmt.Sprintf("masterchain block %d not found", *seqno)}
 		}
 	}
 
 	raw_actions, err := queryRawActionsImpl(query, conn, settings)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	actions := []Action{}
 	book := AddressBook{}
+	metadata := Metadata{}
 	addr_map := map[string]bool{}
 	for idx := range raw_actions {
 		collectAddressesFromAction(&addr_map, &raw_actions[idx])
 		action, err := ParseRawAction(&raw_actions[idx])
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 		actions = append(actions, *action)
 	}
@@ -2662,10 +2926,15 @@ func (db *DbClient) QueryActions(
 		}
 		book, err = queryAddressBookImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+		}
+
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
+		if err != nil {
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
-	return actions, book, nil
+	return actions, book, metadata, nil
 }
 
 // events
@@ -2718,58 +2987,115 @@ func (db *DbClient) QueryPendingActions(
 	return actions, book, nil
 }
 
-func (db *DbClient) QueryEvents(
-	event_req EventRequest,
+func (db *DbClient) QueryTraces(
+	trace_req TracesRequest,
 	utime_req UtimeRequest,
 	lt_req LtRequest,
 	lim_req LimitRequest,
 	settings RequestSettings,
-) ([]Event, AddressBook, error) {
-	query, err := buildEventsQuery(event_req, utime_req, lt_req, lim_req, settings)
+) ([]Trace, AddressBook, Metadata, error) {
+	query, err := buildTracesQuery(trace_req, utime_req, lt_req, lim_req, settings)
 	if settings.DebugRequest {
 		log.Println("Debug query:", query)
 	}
 	// log.Println(query)
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	// read data
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
 	// check block
-	if seqno := event_req.McSeqno; seqno != nil {
+	if seqno := trace_req.McSeqno; seqno != nil {
 		exists, err := queryBlockExists(*seqno, conn, settings)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if !exists {
-			return nil, nil, IndexError{Code: 404, Message: fmt.Sprintf("masterchain block %d not found", *seqno)}
+			return nil, nil, nil, IndexError{Code: 404, Message: fmt.Sprintf("masterchain block %d not found", *seqno)}
 		}
 	}
 
-	res, addr_list, err := queryEventsImpl(query, conn, settings)
+	res, addr_list, err := queryTracesImpl(query, trace_req.IncludeActions, conn, settings)
 	if err != nil {
 		log.Println(query)
-		return nil, nil, IndexError{Code: 500, Message: err.Error()}
+		return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	book := AddressBook{}
-	if settings.NoAddressBook {
-		return res, book, nil
-	}
+	metadata := Metadata{}
 	if len(addr_list) > 0 {
-		book, err = queryAddressBookImpl(addr_list, conn, settings)
+		if !settings.NoAddressBook {
+			book, err = queryAddressBookImpl(addr_list, conn, settings)
+			if err != nil {
+				return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
+			}
+		}
+		metadata, err = queryMetadataImpl(addr_list, conn, settings)
 		if err != nil {
-			return nil, nil, IndexError{Code: 500, Message: err.Error()}
+			return nil, nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
 	}
 
-	return res, book, nil
+	return res, book, metadata, nil
+}
+
+func (db *DbClient) QueryBalanceChanges(
+	req BalanceChangesRequest,
+	settings RequestSettings,
+) (BalanceChangesResult, error) {
+	trace_id := req.TraceId
+	if trace_id == nil && req.ActionId == nil {
+		return BalanceChangesResult{}, IndexError{Code: 400, Message: "trace_id or action_id is required"}
+	}
+
+	conn, err := db.Pool.Acquire(context.Background())
+	ctx, cancel_ctx := context.WithTimeout(context.Background(), settings.Timeout)
+	defer cancel_ctx()
+	if err != nil {
+		return BalanceChangesResult{}, IndexError{Code: 500, Message: err.Error()}
+	}
+	if trace_id == nil && req.ActionId != nil {
+		query := "SELECT trace_id FROM actions WHERE action_id = $1"
+		err := conn.QueryRow(ctx, query, *req.ActionId).Scan(&trace_id)
+		if err != nil {
+			return BalanceChangesResult{}, IndexError{Code: 404, Message: "action_id not found"}
+		}
+	}
+
+	if trace_id == nil {
+		return BalanceChangesResult{}, IndexError{Code: 400, Message: "trace_id is required"}
+	}
+
+	trace_changes, actions_changes, err := CalculateBalanceChanges(HashType(*trace_id), conn)
+	if err != nil {
+		return BalanceChangesResult{}, IndexError{Code: 500, Message: err.Error()}
+	}
+	var targetChanges *BalanceChanges = trace_changes
+	if req.ActionId != nil {
+		if v, ok := actions_changes[HashType(*req.ActionId)]; ok {
+			targetChanges = v
+		} else {
+			return BalanceChangesResult{}, nil
+		}
+	}
+	jetton_changes := make(map[AccountAddress]map[AccountAddress]string)
+	for accountAddress, jettons := range targetChanges.Jettons {
+		jetton_changes[accountAddress] = make(map[AccountAddress]string)
+		for jetton, balance := range jettons {
+			jetton_changes[accountAddress][jetton] = balance.String()
+		}
+	}
+	return BalanceChangesResult{
+		Ton:     targetChanges.get_summarized_balance_changes(),
+		Fees:    targetChanges.Fees,
+		Jettons: jetton_changes,
+	}, nil
 }
 
 func queryPendingTransactions(emulatedContext *EmulatedTracesContext, conn *pgxpool.Conn, settings RequestSettings, filterCompletedTransaction bool) ([]Transaction, error) {
@@ -2868,8 +3194,8 @@ func queryPendingTransactions(emulatedContext *EmulatedTracesContext, conn *pgxp
 	return txs, nil
 }
 
-func queryPendingEventsImpl(emulatedContext *EmulatedTracesContext, conn *pgxpool.Conn, settings RequestSettings) ([]Event, []string, error) {
-	events := []Event{}
+func queryPendingTracesImpl(emulatedContext *EmulatedTracesContext, conn *pgxpool.Conn, settings RequestSettings) ([]Trace, []string, error) {
+	var traces []Trace
 	trace_ids := make([]string, 0)
 	for trace_id, _ := range emulatedContext.emulatedTransactions {
 		trace_ids = append(trace_ids, fmt.Sprintf("'%s'", trace_id))
@@ -2895,9 +3221,9 @@ func queryPendingEventsImpl(emulatedContext *EmulatedTracesContext, conn *pgxpoo
 	}
 	traceRows := emulatedContext.GetTraces()
 	for _, row := range traceRows {
-		if loc, err := ScanEvent(row); err == nil {
+		if loc, err := ScanTrace(row); err == nil {
 			loc.Transactions = make(map[HashType]*Transaction)
-			events = append(events, *loc)
+			traces = append(traces, *loc)
 		} else {
 			return nil, nil, IndexError{Code: 500, Message: err.Error()}
 		}
@@ -2905,9 +3231,9 @@ func queryPendingEventsImpl(emulatedContext *EmulatedTracesContext, conn *pgxpoo
 	events_map := map[HashType]int{}
 	trace_id_list := []HashType{}
 	addr_map := map[string]bool{}
-	for idx := range events {
-		events_map[events[idx].TraceId] = idx
-		trace_id_list = append(trace_id_list, events[idx].TraceId)
+	for idx := range traces {
+		events_map[traces[idx].TraceId] = idx
+		trace_id_list = append(trace_id_list, traces[idx].TraceId)
 	}
 	if len(trace_id_list) > 0 {
 		{
@@ -2920,26 +3246,26 @@ func queryPendingEventsImpl(emulatedContext *EmulatedTracesContext, conn *pgxpoo
 
 				collectAddressesFromTransactions(&addr_map, tx)
 				if v := tx.TraceId; v != nil {
-					event := &events[events_map[*v]]
+					event := &traces[events_map[*v]]
 					event.TransactionsOrder = append(event.TransactionsOrder, tx.Hash)
 					event.Transactions[tx.Hash] = tx
 				}
 			}
 		}
 	}
-	for idx := range events {
-		if len(events[idx].TransactionsOrder) > 0 {
-			trace, err := assembleEventTraceFromMap(&events[idx].TransactionsOrder, &events[idx].Transactions)
+	for idx := range traces {
+		if len(traces[idx].TransactionsOrder) > 0 {
+			trace, err := assembleTraceTxsFromMap(&traces[idx].TransactionsOrder, &traces[idx].Transactions)
 			if err != nil {
-				if len(events[idx].Warning) > 0 {
-					events[idx].Warning += ", " + err.Error()
+				if len(traces[idx].Warning) > 0 {
+					traces[idx].Warning += ", " + err.Error()
 				} else {
-					events[idx].Warning = err.Error()
+					traces[idx].Warning = err.Error()
 				}
 				// return nil, nil, IndexError{Code: 500, Message: fmt.Sprintf("failed to assemble trace: %s", err.Error())}
 			}
 			if trace != nil {
-				events[idx].Trace = trace
+				traces[idx].Trace = trace
 			}
 		}
 	}
@@ -2958,7 +3284,11 @@ func queryPendingEventsImpl(emulatedContext *EmulatedTracesContext, conn *pgxpoo
 		if err != nil {
 			return nil, nil, IndexError{Code: 500, Message: fmt.Sprintf("failed to parse action: %s", err.Error())}
 		}
-		events[events_map[action.TraceId]].Actions = append(events[events_map[action.TraceId]].Actions, action)
+		if traces[events_map[action.TraceId]].Actions == nil {
+			new_actions := make([]*Action, 0)
+			traces[events_map[action.TraceId]].Actions = &new_actions
+		}
+		*traces[events_map[action.TraceId]].Actions = append(*traces[events_map[action.TraceId]].Actions, action)
 	}
 	//
 	addr_list := []string{}
@@ -2966,7 +3296,7 @@ func queryPendingEventsImpl(emulatedContext *EmulatedTracesContext, conn *pgxpoo
 		addr_list = append(addr_list, k)
 	}
 	//
-	return events, addr_list, nil
+	return traces, addr_list, nil
 }
 
 func queryCompletedEmulatedTraces(emulatedContext *EmulatedTracesContext,
@@ -3043,14 +3373,14 @@ func (db *DbClient) QueryPendingTransactions(
 	return txs, book, nil
 }
 
-func (db *DbClient) QueryPendingEvents(settings RequestSettings, emulatedContext *EmulatedTracesContext) ([]Event, AddressBook, error) {
+func (db *DbClient) QueryPendingTraces(settings RequestSettings, emulatedContext *EmulatedTracesContext) ([]Trace, AddressBook, error) {
 	conn, err := db.Pool.Acquire(context.Background())
 	if err != nil {
 		return nil, nil, IndexError{Code: 500, Message: err.Error()}
 	}
 	defer conn.Release()
 
-	res, addr_list, err := queryPendingEventsImpl(emulatedContext, conn, settings)
+	res, addr_list, err := queryPendingTracesImpl(emulatedContext, conn, settings)
 	if err != nil {
 		//log.Println(query)
 		return nil, nil, IndexError{Code: 500, Message: err.Error()}

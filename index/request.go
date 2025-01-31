@@ -14,7 +14,7 @@ type RequestSettings struct {
 	V2ApiKey             string
 	DefaultLimit         int
 	MaxLimit             int
-	MaxEventTransactions int
+	MaxTraceTransactions int
 	DebugRequest         bool
 	NoAddressBook        bool
 }
@@ -49,12 +49,14 @@ type AdjacentTransactionRequest struct {
 }
 
 type MessageRequest struct {
-	Direction   *string                 `query:"direction"`
-	MessageHash []HashType              `query:"msg_hash"`
-	Source      *AccountAddressNullable `query:"source"`
-	Destination *AccountAddressNullable `query:"destination"`
-	BodyHash    *HashType               `query:"body_hash"`
-	Opcode      *OpcodeType             `query:"opcode"`
+	Direction        *string                 `query:"direction"`
+	ExcludeExternals *bool                   `query:"exclude_externals"`
+	OnlyExternals    *bool                   `query:"only_externals"`
+	MessageHash      []HashType              `query:"msg_hash"`
+	Source           *AccountAddressNullable `query:"source"`
+	Destination      *AccountAddressNullable `query:"destination"`
+	BodyHash         *HashType               `query:"body_hash"`
+	Opcode           *OpcodeType             `query:"opcode"`
 }
 
 type NFTCollectionRequest struct {
@@ -118,15 +120,23 @@ type AccountRequest struct {
 }
 
 type ActionRequest struct {
-	AccountAddress  *AccountAddress `query:"account"`
-	TransactionHash []HashType      `query:"tx_hash"`
-	MessageHash     []HashType      `query:"msg_hash"`
-	TraceId         []HashType      `query:"trace_id"`
-	ActionId        []HashType      `query:"action_id"`
-	McSeqno         *int32          `query:"mc_seqno"`
+	AccountAddress     *AccountAddress `query:"account"`
+	TransactionHash    []HashType      `query:"tx_hash"`
+	MessageHash        []HashType      `query:"msg_hash"`
+	TraceId            []HashType      `query:"trace_id"`
+	ActionId           []HashType      `query:"action_id"`
+	McSeqno            *int32          `query:"mc_seqno"`
+	IncludeActionTypes []string        `query:"action_type"`
+	ExcludeActionTypes []string        `query:"exclude_action_type"`
 }
 
-type EventRequest struct {
+type BalanceChangesRequest struct {
+	TraceId  *string `query:"trace_id"`
+	ActionId *string `query:"action_id"`
+}
+
+type TracesRequest struct {
+	IncludeActions  bool            `query:"include_actions"`
 	AccountAddress  *AccountAddress `query:"account"`
 	TraceId         []HashType      `query:"trace_id"`
 	TransactionHash []HashType      `query:"tx_hash"`

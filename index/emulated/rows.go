@@ -319,26 +319,26 @@ func (t *ActionRow) getAssigns() []assign {
 		assignStringPtr(t.ChangeDNSRecordValue),
 		assignIntPtr(t.ChangeDNSRecordFlags),
 		assignStringPtr(t.NFTMintNFTItemIndex),
-		//assignStringPtr(t.DexWithdrawLiquidityDataDex),
-		//assignStringPtr(t.DexWithdrawLiquidityDataAmount1),
-		//assignStringPtr(t.DexWithdrawLiquidityDataAmount2),
-		//assignStringPtr(t.DexWithdrawLiquidityDataAsset1Out),
-		//assignStringPtr(t.DexWithdrawLiquidityDataAsset2Out),
-		//assignStringPtr(t.DexWithdrawLiquidityDataUserJettonWallet1),
-		//assignStringPtr(t.DexWithdrawLiquidityDataUserJettonWallet2),
-		//assignStringPtr(t.DexWithdrawLiquidityDataDexJettonWallet1),
-		//assignStringPtr(t.DexWithdrawLiquidityDataDexJettonWallet2),
-		//assignStringPtr(t.DexWithdrawLiquidityDataLpTokensBurnt),
-		//assignStringPtr(t.DexDepositLiquidityDataDex),
-		//assignStringPtr(t.DexDepositLiquidityDataAmount1),
-		//assignStringPtr(t.DexDepositLiquidityDataAmount2),
-		//assignStringPtr(t.DexDepositLiquidityDataAsset1),
-		//assignStringPtr(t.DexDepositLiquidityDataAsset2),
-		//assignStringPtr(t.DexDepositLiquidityDataUserJettonWallet1),
-		//assignStringPtr(t.DexDepositLiquidityDataUserJettonWallet2),
-		//assignStringPtr(t.DexDepositLiquidityDataLpTokensMinted),
-		//assignStringPtr(t.StakingDataProvider),
-		//assignStringPtr(t.StakingDataTsNft),
+		assignStringPtr(t.DexWithdrawLiquidityDataDex),
+		assignStringPtr(t.DexWithdrawLiquidityDataAmount1),
+		assignStringPtr(t.DexWithdrawLiquidityDataAmount2),
+		assignStringPtr(t.DexWithdrawLiquidityDataAsset1Out),
+		assignStringPtr(t.DexWithdrawLiquidityDataAsset2Out),
+		assignStringPtr(t.DexWithdrawLiquidityDataUserJettonWallet1),
+		assignStringPtr(t.DexWithdrawLiquidityDataUserJettonWallet2),
+		assignStringPtr(t.DexWithdrawLiquidityDataDexJettonWallet1),
+		assignStringPtr(t.DexWithdrawLiquidityDataDexJettonWallet2),
+		assignStringPtr(t.DexWithdrawLiquidityDataLpTokensBurnt),
+		assignStringPtr(t.DexDepositLiquidityDataDex),
+		assignStringPtr(t.DexDepositLiquidityDataAmount1),
+		assignStringPtr(t.DexDepositLiquidityDataAmount2),
+		assignStringPtr(t.DexDepositLiquidityDataAsset1),
+		assignStringPtr(t.DexDepositLiquidityDataAsset2),
+		assignStringPtr(t.DexDepositLiquidityDataUserJettonWallet1),
+		assignStringPtr(t.DexDepositLiquidityDataUserJettonWallet2),
+		assignStringPtr(t.DexDepositLiquidityDataLpTokensMinted),
+		assignStringPtr(t.StakingDataProvider),
+		assignStringPtr(t.StakingDataTsNft),
 		assignBool(t.Success),
 	}
 }
@@ -572,7 +572,7 @@ func assignHashSlice(src []string) assign {
 				// If the slice element type is string
 				slice := reflect.MakeSlice(dv.Type(), len(src), len(src))
 				for i, v := range src {
-					slice.Index(i).Set(reflect.ValueOf(v))
+					slice.Index(i).SetString(v)
 				}
 				dv.Set(slice)
 			} else if elemType.Kind() == reflect.Ptr && elemType.Elem().Kind() == reflect.String {
