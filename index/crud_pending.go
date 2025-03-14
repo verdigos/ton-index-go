@@ -352,7 +352,6 @@ func queryPendingTracesImpl(emulatedContext *EmulatedTracesContext, conn *pgxpoo
 		*traces[events_map[action.TraceId]].Actions = append(*traces[events_map[action.TraceId]].Actions, action)
 	}
 	//
-	var addr_list []string
 	for k := range addr_map {
 		addr_list = append(addr_list, k)
 	}
